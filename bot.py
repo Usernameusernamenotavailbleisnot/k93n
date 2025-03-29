@@ -300,6 +300,7 @@ class HttpClient:
         skip_base_headers: bool = False,
         retry_count: int = 0,
         max_retries: int = 2,
+        allow_already_started: bool = False,  # Parameter baru
         **kwargs
     ) -> Optional[Dict]:
         """Make an HTTP request with error handling and retries."""
@@ -339,6 +340,18 @@ class HttpClient:
                 if response.status == 401 and not is_discord and retry_count < max_retries:
                     self.logger.info("Got 401, token may need refresh")
                     return None  # Signal for token refresh
+                
+                # Check for "already started" error if allow_already_started is True
+                if allow_already_started and response.status == 409:
+                    try:
+                        error_data = json.loads(text)
+                        error_code = error_data.get('errCode', '')
+                        if error_code == 'AIRDROP_CAMPAIGN_USER_HAS_ALREADY_STARTED':
+                            self.logger.info("Campaign already started (detected from HTTP client)")
+                            # Return special response to indicate already started
+                            return {"already_started": True}
+                    except:
+                        pass
                         
                 # Handle error responses
                 try:
@@ -384,6 +397,7 @@ class HttpClient:
                     skip_base_headers,
                     retry_count + 1,
                     max_retries,
+                    allow_already_started,  # Pass the parameter forward
                     **kwargs
                 )
                 
@@ -649,29 +663,34 @@ class CampaignManager:
         try:
             endpoint = f"/platform-campaign-hub/s2s/airdrop-campaign/user-progress/{self.user_id}/campaigns/{campaign_id}/start"
             
-            try:
-                response = await self.http.make_request("POST", endpoint, json={})
-                if response:
-                    self.logger.success(f"Started campaign: {campaign_id}")
-                    return True
-            except Exception as e:
-                # Check if campaign is already started (common error)
-                error_msg = str(e).lower()
-                if "already started" in error_msg or "has_already_started" in error_msg:
-                    self.logger.info(f"Campaign already started, proceeding with tasks")
-                    return True
-                raise
-                    
+            # Gunakan parameter allow_already_started=True untuk mendeteksi error tersebut di HTTP client
+            response = await self.http.make_request("POST", endpoint, json={}, allow_already_started=True)
+            
+            # Cek apakah campaign sudah dimulai
+            if response and response.get('already_started', False):
+                self.logger.info(f"Campaign already started: {campaign_id}, proceeding with tasks")
+                return True
+                
+            # Jika response valid dan bukan error
+            if response:
+                self.logger.success(f"Started campaign: {campaign_id}")
+                return True
+                
             return False
             
         except Exception as e:
+            error_msg = str(e).lower()
+            
+            # Perbaikan pengecekan kata kunci di pesan error
+            if ("already started" in error_msg or 
+                "has_already_started" in error_msg or 
+                "airdrop_campaign_user_has_already_started" in error_msg):
+                self.logger.info(f"Campaign already started (detected from exception): {campaign_id}")
+                return True
+                
             self.logger.error(f"Error starting campaign {campaign_id}", 
                             error_code=getattr(e, 'status', 'UNKNOWN'),
                             details=str(e))
-            # Check if the error indicates campaign already started
-            if "already started" in str(e).lower() or "has_already_started" in str(e).lower():
-                self.logger.info(f"Campaign already started, proceeding with tasks")
-                return True
             return False
 
     async def get_campaign_progress(self, campaign_id: str) -> Dict:
