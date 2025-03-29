@@ -423,80 +423,110 @@ class AuthManager:
         self.tokens = AuthTokens()
         self.user_id = None
         
-    async def login_with_discord(self, discord_token: str) -> bool:
-        """Login to KGen using Discord token."""
-        try:
-            # 1. Get auth code from Discord
-            auth_code = await self._get_discord_auth_code(discord_token)
-            if not auth_code:
-                return False
+    async def login_with_discord(self, discord_token: str, max_retries: int = 3) -> bool:
+        """Login to KGen using Discord token with retry mechanism."""
+        for retry_count in range(max_retries):
+            try:
+                # Jika ini bukan percobaan pertama, tampilkan pesan retry
+                if retry_count > 0:
+                    self.logger.info(f"Mencoba login ulang (percobaan {retry_count+1}/{max_retries})...")
+                    # Tambahkan penundaan yang semakin lama untuk setiap percobaan
+                    await asyncio.sleep(2 * retry_count)
                 
-            await asyncio.sleep(random.uniform(1, 2))
-                
-            # 2. Authenticate with KGen using the auth code
-            authenticated = await self._authenticate_with_kgen(auth_code)
-            if not authenticated:
-                return False
-                
-            await asyncio.sleep(random.uniform(1, 2))
-                
-            # 3. Get user profile to confirm login
-            profile = await self._get_user_profile()
-            if not profile:
-                return False
-                
-            self.logger.success(f"Successfully logged in. User ID: {self.user_id}")
-            return True
-                
-        except Exception as e:
-            self.logger.error("Login error", details=str(e))
-            return False
+                # 1. Get auth code from Discord
+                auth_code = await self._get_discord_auth_code(discord_token)
+                if not auth_code:
+                    continue  # Coba lagi jika gagal mendapatkan auth code
+                    
+                await asyncio.sleep(random.uniform(1, 2))
+                    
+                # 2. Authenticate with KGen using the auth code
+                authenticated = await self._authenticate_with_kgen(auth_code)
+                if not authenticated:
+                    continue  # Coba lagi jika gagal autentikasi
+                    
+                await asyncio.sleep(random.uniform(1, 2))
+                    
+                # 3. Get user profile to confirm login
+                profile = await self._get_user_profile()
+                if not profile:
+                    continue  # Coba lagi jika gagal mendapatkan profil
+                    
+                self.logger.success(f"Successfully logged in. User ID: {self.user_id}")
+                return True
+                    
+            except Exception as e:
+                error_msg = str(e)
+                # Jika ini adalah percobaan terakhir, log sebagai error
+                if retry_count == max_retries - 1:
+                    self.logger.error("Login error", details=error_msg)
+                else:
+                    # Jika masih ada percobaan tersisa, log sebagai warning
+                    self.logger.warning(f"Login gagal: {error_msg} (akan coba lagi)")
+        
+        # Jika semua percobaan gagal
+        self.logger.error(f"Gagal login setelah {max_retries} percobaan")
+        return False
 
-    async def _get_discord_auth_code(self, discord_token: str) -> Optional[str]:
-        """Get authorization code from Discord OAuth."""
-        try:
-            auth_headers = DISCORD_AUTH_HEADERS.copy()
-            auth_headers["Authorization"] = discord_token
+    async def _get_discord_auth_code(self, discord_token: str, max_retries: int = 2) -> Optional[str]:
+        """Get authorization code from Discord OAuth with retry."""
+        for retry in range(max_retries + 1):
+            try:
+                if retry > 0:
+                    self.logger.info(f"Mencoba mendapatkan auth code lagi (percobaan {retry}/{max_retries})...")
+                    await asyncio.sleep(1 * retry)  # Backoff penundaan
+                    
+                auth_headers = DISCORD_AUTH_HEADERS.copy()
+                auth_headers["Authorization"] = discord_token
 
-            auth_payload = {
-                "permissions": "0",
-                "authorize": True,
-                "integration_type": 0
-            }
+                auth_payload = {
+                    "permissions": "0",
+                    "authorize": True,
+                    "integration_type": 0
+                }
 
-            params = {
-                "client_id": DISCORD_CLIENT_ID,
-                "response_type": "code",
-                "redirect_uri": DISCORD_REDIRECT_URI,
-                "scope": DISCORD_SCOPE,
-                "state": DISCORD_STATE,
-                "integration_type": "0"
-            }
+                params = {
+                    "client_id": DISCORD_CLIENT_ID,
+                    "response_type": "code",
+                    "redirect_uri": DISCORD_REDIRECT_URI,
+                    "scope": DISCORD_SCOPE,
+                    "state": DISCORD_STATE,
+                    "integration_type": "0"
+                }
 
-            auth_response = await self.http.make_request(
-                "POST", 
-                "/oauth2/authorize",
-                is_discord=True,
-                headers=auth_headers,
-                params=params,
-                json=auth_payload
-            )
-            
-            if not auth_response:
-                self.logger.error("No response from auth request")
+                auth_response = await self.http.make_request(
+                    "POST", 
+                    "/oauth2/authorize",
+                    is_discord=True,
+                    headers=auth_headers,
+                    params=params,
+                    json=auth_payload
+                )
+                
+                if not auth_response:
+                    if retry < max_retries:
+                        continue
+                    self.logger.error("No response from auth request")
+                    return None
+                    
+                if "location" not in auth_response:
+                    if retry < max_retries:
+                        continue
+                    self.logger.error("No location in auth response", details=str(auth_response))
+                    return None
+
+                auth_code = auth_response["location"].split("code=")[1].split("&")[0]
+                self.logger.info(f"Got authorization code: {auth_code[:10]}...")
+                return auth_code
+                    
+            except Exception as e:
+                if retry < max_retries:
+                    self.logger.warning(f"Error mendapatkan auth code: {str(e)} (akan coba lagi)")
+                    continue
+                self.logger.error("Failed to get Discord auth code", details=str(e))
                 return None
                 
-            if "location" not in auth_response:
-                self.logger.error("No location in auth response", details=str(auth_response))
-                return None
-
-            auth_code = auth_response["location"].split("code=")[1].split("&")[0]
-            self.logger.info(f"Got authorization code: {auth_code[:10]}...")
-            return auth_code
-            
-        except Exception as e:
-            self.logger.error("Failed to get Discord auth code", details=str(e))
-            return None
+        return None  # Semua percobaan gagal
 
     async def _authenticate_with_kgen(self, auth_code: str) -> bool:
         """Authenticate with KGen using Discord auth code."""
@@ -852,9 +882,9 @@ class KGenBot:
             # Setup authentication manager
             self.auth_manager = AuthManager(self.http_client, self.logger)
             
-            # Login to account
-            if not await self.auth_manager.login_with_discord(discord_token):
-                self.logger.error("Failed to login with Discord token")
+            # Login to account with max 3 kali retry
+            if not await self.auth_manager.login_with_discord(discord_token, max_retries=3):
+                self.logger.error("Failed to login with Discord token after retries")
                 return False
                 
             await asyncio.sleep(random.uniform(2, 4))
